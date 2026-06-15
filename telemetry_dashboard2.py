@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-BAUD_RATE = 921600
+BAUD_RATE = 2000000
 
 CAN_ID_CONTROL = 0x200
 CAN_ID_TELEM_SUMMARY = 0x700
@@ -1500,6 +1500,17 @@ class TelemetryWindow(QMainWindow):
             btn = QPushButton(text)
             btn.clicked.connect(lambda _, c=cmd: self._send_serial_line(c))
             cmd_row.addWidget(btn)
+
+        # ── Bridge-only toggle ──
+        bridge_btn = QPushButton("Bridge Only")
+        bridge_btn.setStyleSheet("font-weight:700; background:#b00020; color:white; padding:4px 10px;")
+        bridge_btn.clicked.connect(lambda: self._send_serial_line("BRIDGEONLY"))
+        cmd_row.addWidget(bridge_btn)
+
+        full_btn = QPushButton("Full Mode")
+        full_btn.setStyleSheet("font-weight:700; background:#0a7f2e; color:white; padding:4px 10px;")
+        full_btn.clicked.connect(lambda: self._send_serial_line("BRIDGEFULL"))
+        cmd_row.addWidget(full_btn)
 
         clear_btn = QPushButton("Clear Modem Log")
         clear_btn.clicked.connect(lambda: self.modem_log.clear())
