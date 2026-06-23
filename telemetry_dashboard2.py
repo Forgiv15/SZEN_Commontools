@@ -61,6 +61,8 @@ CAN_ID_EFUSE_PEAKMIN_BASE = 0x794
 CAN_ID_TEMP_SUMMARY = 0x792
 CAN_ID_PMBUS_STATS = 0x793
 CAN_ID_REG_VERIFY_STAT = 0x796
+CAN_ID_VERIFY_DETAIL_BASE = 0x7A0  # 0x7A0-0x7A7 per-ch register readback
+CAN_ID_REINIT_STATUS = 0x086  # per-ch reinit counters
 CAN_ID_INPUT8_STATUS = 0x085
 
 CAN_BUS_BITRATE_BPS = 500_000
@@ -80,6 +82,7 @@ CONTROL_OP_I2C_SCAN_MODE = 0x06
 CONTROL_OP_DVDT_CONFIG = 0x07
 CONTROL_OP_EFUSE_DEBUG = 0x08
 CONTROL_OP_RESET_PEAKS = 0x09
+CONTROL_OP_REINIT_EFUSE = 0x0A  # force re-init of one or all eFuses
 
 CONTROL_FLAG_DEBUG = 0x04
 OVERRIDE_FLAG_ARMED = 0x01
@@ -704,6 +707,13 @@ class TelemetryWindow(QMainWindow):
         self.pmbus_sweep_errors = 0
         self.reg_verify_ok_mask = 0
         self.reg_verify_fail_mask = 0
+        self.verify_vin_uv_flt = [0xFFFF] * 8  # per-eFuse VIN_UV_FLT readback
+        self.verify_device_config = [0] * 8
+        self.verify_retry_config = [0] * 8
+        self.verify_oc_timer = [0] * 8
+        self.verify_viref = [0] * 8
+        self.verify_flags = [0] * 8  # bit0=ok bit1=fail
+        self.efuse_reinit_count = [0] * 8  # per-eFuse re-init counter
 
         self.mcu_shunt = 0
         self.flt_bits = 0
@@ -1174,6 +1184,11 @@ class TelemetryWindow(QMainWindow):
         peaks_btn.clicked.connect(lambda: self._send_pdu_command(CONTROL_OP_RESET_PEAKS, 0))
         controls_layout.addWidget(peaks_btn)
 
+        reinit_btn = QPushButton("Re-init All eFuses")
+        reinit_btn.setStyleSheet("font-weight:700; background:#e67e22; color:white; padding:4px 10px;")
+        reinit_btn.clicked.connect(lambda: self._send_pdu_command(CONTROL_OP_REINIT_EFUSE, 0xFF))
+        controls_layout.addWidget(reinit_btn)
+
         controls_layout.addStretch()
         sl.addWidget(controls_box)
 
@@ -1193,6 +1208,30 @@ class TelemetryWindow(QMainWindow):
             self.reg_verify_labels.append(lbl)
         reg_verify_layout.addStretch()
         sl.addWidget(reg_verify_box)
+
+        # ── Register Verify Detail (per-eFuse readback values) ──
+        verify_detail_box = QGroupBox("Register Verify Detail (Readback Values)")
+        verify_detail_layout = QGridLayout(verify_detail_box)
+        verify_detail_layout.addWidget(QLabel("eFuse"), 0, 0)
+        verify_detail_layout.addWidget(QLabel("VIN_UV_FLT"), 0, 1)
+        verify_detail_layout.addWidget(QLabel("OC_TIMER"), 0, 2)
+        verify_detail_layout.addWidget(QLabel("VIREF"), 0, 3)
+        verify_detail_layout.addWidget(QLabel("DEV_CFG"), 0, 4)
+        verify_detail_layout.addWidget(QLabel("RETRY_CFG"), 0, 5)
+        verify_detail_layout.addWidget(QLabel("Flags"), 0, 6)
+        verify_detail_layout.addWidget(QLabel("Re-inits"), 0, 7)  # NEW column
+        self._verify_detail_labels: list[list[QLabel]] = []
+        for row_i, name in enumerate(PDU_OUTPUTS, start=1):
+            verify_detail_layout.addWidget(QLabel(name), row_i, 0)
+            row_labels = []
+            for col_j in range(7):  # was 6, now 7
+                lbl = QLabel("--")
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setStyleSheet("padding:2px 6px; font-family:monospace; font-size:11px;")
+                verify_detail_layout.addWidget(lbl, row_i, col_j + 1)
+                row_labels.append(lbl)
+            self._verify_detail_labels.append(row_labels)
+        sl.addWidget(verify_detail_box)
 
         efuse_debug_box = QGroupBox("Per-eFuse Detailed Debug Windows")
         efuse_debug_layout = QHBoxLayout(efuse_debug_box)
@@ -1515,6 +1554,11 @@ class TelemetryWindow(QMainWindow):
         clear_btn = QPushButton("Clear Modem Log")
         clear_btn.clicked.connect(lambda: self.modem_log.clear())
         cmd_row.addWidget(clear_btn)
+
+        probe_btn = QPushButton("Probe Modem")
+        probe_btn.setStyleSheet("font-weight:700; background:#e67e22; color:white; padding:4px 10px;")
+        probe_btn.clicked.connect(lambda: self._send_serial_line("MODEMPROBE"))
+        cmd_row.addWidget(probe_btn)
         cmd_row.addStretch()
         layout.addLayout(cmd_row)
 
@@ -1604,6 +1648,7 @@ class TelemetryWindow(QMainWindow):
         self.modem_operator_label = QLabel("--")
         self.modem_info_label = QLabel("--")
         self.modem_boot_timer_label = QLabel("possibly not booted modem")
+        self.modem_probe_label = QLabel("--")
         self.modem_event_label = QLabel(self.modem_last_event_text)
         self.modem_event_label.setWordWrap(True)
         status_layout.addRow("UART ready:", self.modem_uart_label)
@@ -1627,6 +1672,7 @@ class TelemetryWindow(QMainWindow):
         status_layout.addRow("Operator:", self.modem_operator_label)
         status_layout.addRow("Modem info:", self.modem_info_label)
         status_layout.addRow("14s boot timer:", self.modem_boot_timer_label)
+        status_layout.addRow("AT probe result:", self.modem_probe_label)
         status_layout.addRow("Last event:", self.modem_event_label)
         layout.addWidget(status_box)
 
@@ -2142,6 +2188,12 @@ class TelemetryWindow(QMainWindow):
                 self.modem_fields[key.strip()] = value.strip()
             return
 
+        if line.startswith("MODEM,PROBE,"):
+            status = line.split(",")[2] if len(line.split(",")) > 2 else "UNKNOWN"
+            self.modem_fields["PROBE"] = status
+            self.modem_last_event_text = f"AT probe: {status}"
+            return
+
         if line.startswith("MQTT,STATE,"):
             for part in line.split(",")[2:]:
                 if "=" not in part:
@@ -2360,6 +2412,16 @@ class TelemetryWindow(QMainWindow):
             self.reg_verify_fail_mask = payload[1]
             return
 
+        if CAN_ID_VERIFY_DETAIL_BASE <= can_id <= CAN_ID_VERIFY_DETAIL_BASE + 7 and len(payload) >= 8:
+            idx = can_id - CAN_ID_VERIFY_DETAIL_BASE
+            self.verify_vin_uv_flt[idx] = payload[0] | (payload[1] << 8)
+            self.verify_oc_timer[idx] = payload[2]
+            self.verify_viref[idx] = payload[3]
+            self.verify_device_config[idx] = payload[4] | (payload[5] << 8)
+            self.verify_retry_config[idx] = payload[6]
+            self.verify_flags[idx] = payload[7]
+            return
+
         if CAN_ID_ERR_DETAIL_BASE <= can_id <= CAN_ID_ERR_DETAIL_LAST and len(payload) >= 6:
             slot = can_id - CAN_ID_ERR_DETAIL_BASE
             if payload[1] != 0:
@@ -2487,6 +2549,11 @@ class TelemetryWindow(QMainWindow):
             self.pmbus_sweep_ms = payload[2] | (payload[3] << 8)
             self.pmbus_sweep_count = payload[4] | (payload[5] << 8)
             self.pmbus_sweep_errors = payload[6] | (payload[7] << 8)
+            return
+
+        if can_id == CAN_ID_REINIT_STATUS and len(payload) >= 8:
+            for i in range(8):
+                self.efuse_reinit_count[i] = payload[i]
             return
 
     def _append_pmbus_trace_line(self, seq: int):
@@ -2774,6 +2841,11 @@ class TelemetryWindow(QMainWindow):
         self.modem_gprs_label.setText(modem_gprs)
         self.modem_internet_label.setText(modem_internet)
         self.modem_signal_label.setText(self.modem_fields.get("CSQ", "--"))
+        self.modem_probe_label.setText(self.modem_fields.get("PROBE", "--"))
+        probe_val = self.modem_fields.get("PROBE", "--")
+        self.modem_probe_label.setStyleSheet(
+            "font-weight:700; color:#0a7f2e;" if probe_val == "OK" else "font-weight:700; color:#b00020;" if probe_val == "FAIL" else ""
+        )
         self.modem_http_code_label.setText(self.modem_fields.get("HTTP_CODE", "--"))
         self.modem_apn_label.setText(self.modem_fields.get("APN", "--"))
         self.modem_ip_label.setText(self.modem_fields.get("IP", "--"))
@@ -3030,6 +3102,27 @@ class TelemetryWindow(QMainWindow):
                 style = "padding:4px 8px; background:#444; color:white; font-weight:700; border-radius:4px;"
             self.reg_verify_labels[i].setText(text)
             self.reg_verify_labels[i].setStyleSheet(style)
+
+            # Verify detail table — per-eFuse register readback values
+            if i < len(self._verify_detail_labels):
+                vuvf = self.verify_vin_uv_flt[i]
+                vcfg = self.verify_device_config[i]
+                vret = self.verify_retry_config[i]
+                voct = self.verify_oc_timer[i]
+                vvir = self.verify_viref[i]
+                vflg = self.verify_flags[i]
+                vok = "OK" if (vflg & 1) else ("FAIL" if (vflg & 2) else "--")
+                vflg_style = "color:#0a7f2e; font-weight:700;" if (vflg & 1) else ("color:#b00020; font-weight:700;" if (vflg & 2) else "color:#888;")
+                labels = self._verify_detail_labels[i]
+                labels[0].setText(f"0x{vuvf:04X}")
+                labels[1].setText(f"0x{voct:02X}")
+                labels[2].setText(f"0x{vvir:02X}")
+                labels[3].setText(f"0x{vcfg:04X}")
+                labels[4].setText(f"0x{vret:02X}")
+                labels[5].setText(vok)
+                labels[5].setStyleSheet(f"padding:2px 6px; font-family:monospace; font-size:11px; {vflg_style}")
+            if len(labels) >= 7:
+                labels[6].setText(str(self.efuse_reinit_count[i]))
 
         self.pmbus_stats_label.setText(
             f"sweeps: {self.pmbus_sweeps_per_sec}/s  "
